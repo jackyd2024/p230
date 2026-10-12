@@ -1,0 +1,402 @@
+name: Build official Dropbear for Phicomm P230 Android ARM64
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Cross-compile Dropbear for Android 7.1+ ARM64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      DROPBEAR_TAG: DROPBEAR_2026.94
+      NDK_VERSION: r30
+      ANDROID_API: 21
+    steps:
+      - name: Install host build dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential ca-certificates curl file git make python3 unzip binutils
+
+      - name: Download the official Google Android NDK and verify checksum
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$RUNNER_TEMP"
+          curl --fail --location --retry 3 --retry-delay 2 \
+            "https://dl.google.com/android/repository/android-ndk-${NDK_VERSION}-linux.zip" \
+            -o android-ndk.zip
+          # SHA-1 is the integrity checksum published on Google's official NDK download page.
+          echo '5107f898313790e449e87eee2183d9a20602dee9  android-ndk.zip' | sha1sum --check --status
+          unzip -q android-ndk.zip
+          test -x "$RUNNER_TEMP/android-ndk-${NDK_VERSION}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang"
+
+      - name: Fetch official Dropbear source tag
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git clone --depth 1 --branch "$DROPBEAR_TAG" https://github.com/mkj/dropbear.git dropbear-src
+          mkdir -p dist
+          git -C dropbear-src rev-parse HEAD | tee dist/UPSTREAM_COMMIT.txt
+          printf 'Upstream: https://github.com/mkj/dropbear\nTag: %s\n' "$DROPBEAR_TAG" > dist/SOURCE_INFO.txt
+
+      - name: Apply small Android-specific build settings
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          root = Path('dropbear-src')
+          options = root / 'src/default_options.h'
+          s = options.read_text()
+          replacements = {
+              '#define DROPBEAR_SVR_PASSWORD_AUTH 1': '#define DROPBEAR_SVR_PASSWORD_AUTH 0',
+              '#define DEFAULT_PATH "/usr/bin:/bin"': '#define DEFAULT_PATH "/system/bin:/system/xbin:/vendor/bin:/vendor/xbin:/sbin:/bin"',
+              '#define DEFAULT_ROOT_PATH "/usr/sbin:/usr/bin:/sbin:/bin"': '#define DEFAULT_ROOT_PATH "/system/sbin:/system/bin:/system/xbin:/vendor/bin:/vendor/xbin:/sbin:/bin"',
+          }
+          for old, new in replacements.items():
+              count = s.count(old)
+              if count != 1:
+                  raise SystemExit(f'Expected exactly one occurrence of {old!r}, found {count}')
+              s = s.replace(old, new)
+          options.write_text(s)
+
+          # Android's /data mount may be group-writable. Keep the root user's home
+          # inside the root-owned service directory so upstream key permission checks
+          # stop there instead of walking into Android's /data mount.
+          common = root / 'src/common-session.c'
+          s = common.read_text()
+          needle = 'ses.authstate.pw_shell = m_strdup(pw->pw_shell);'
+          if s.count(needle) != 1:
+              raise SystemExit('Could not find the expected pw_shell assignment in common-session.c')
+          replacement = r'''ses.authstate.pw_shell = m_strdup(pw->pw_shell);
+          if (strcmp(username, "root") == 0) {
+              /* Android root shell: use the persistent app-independent data directory. */
+              m_free(ses.authstate.pw_dir);
+              ses.authstate.pw_dir = m_strdup("/data/ssh-dropbear");
+              if (ses.authstate.pw_shell[0] == '\0' || strcmp(ses.authstate.pw_shell, "/bin/sh") == 0) {
+                  m_free(ses.authstate.pw_shell);
+                  ses.authstate.pw_shell = m_strdup("/system/bin/sh");
+              }
+          }'''
+          common.write_text(s.replace(needle, replacement))
+
+          # Also make the default empty-shell fallback Android-specific.
+          s = common.read_text()
+          if s.count('return "/bin/sh";') != 1:
+              raise SystemExit('Could not find the expected /bin/sh fallback in common-session.c')
+          common.write_text(s.replace('return "/bin/sh";', 'return "/system/bin/sh";'))
+
+          # Check the authorized_keys file itself. Since the root home is set to
+          # /data/ssh-dropbear above, the upstream directory traversal stops after
+          # checking that root-owned 0700 directory instead of checking /data.
+          auth = root / 'src/svr-authpubkey.c'
+          s = auth.read_text()
+          start = s.index('static int checkpubkeyperms() {')
+          end = s.index('/* Checks whether a file is owned by the user or root', start)
+          replacement = r'''static int checkpubkeyperms() {
+              char *path = authorized_keys_filepath(), *sep = NULL;
+              int ret = DROPBEAR_SUCCESS;
+
+              if (checkfileperm(path) != DROPBEAR_SUCCESS) {
+                  ret = DROPBEAR_FAILURE;
+              }
+              while (ret == DROPBEAR_SUCCESS && (sep = strrchr(path, '/')) != NULL) {
+                  if (sep == path) { /* root directory */
+                      sep++;
+                  }
+                  *sep = '\0';
+                  if (checkfileperm(path) != DROPBEAR_SUCCESS) {
+                      ret = DROPBEAR_FAILURE;
+                  }
+                  if (strcmp(path, svr_opts.authorized_keys_dir) == 0
+                          || strcmp(path, ses.authstate.pw_dir) == 0
+                          || strcmp(path, "/") == 0) {
+                      break;
+                  }
+              }
+              m_free(path);
+              return ret;
+          }
+          '''
+          auth.write_text(s[:start] + replacement + s[end:])
+          PY
+          git -C dropbear-src diff -- src/default_options.h src/common-session.c src/svr-authpubkey.c > dist/android-local-patches.diff
+          cat >> dist/SOURCE_INFO.txt <<EOF2
+          Android target: ARM64 / aarch64-linux-android
+          Minimum API level: ${ANDROID_API}
+          NDK: Android NDK ${NDK_VERSION} (downloaded from dl.google.com; official checksum verified)
+          Local changes: see android-local-patches.diff
+          - Disable SSH password authentication at compile time; public-key authentication remains enabled.
+          - Add Android system directories to the interactive shell PATH.
+          - Set root home/shell paths for Android, disable password authentication, and check key-file/directory permissions.
+          EOF2
+
+      - name: Cross-compile for Android ARM64
+        shell: bash
+        run: |
+          set -euxo pipefail
+          TOOLCHAIN="$RUNNER_TEMP/android-ndk-${NDK_VERSION}/toolchains/llvm/prebuilt/linux-x86_64"
+          export PATH="$TOOLCHAIN/bin:$PATH"
+          export CC="$TOOLCHAIN/bin/aarch64-linux-android${ANDROID_API}-clang"
+          export AR="$TOOLCHAIN/bin/llvm-ar"
+          export RANLIB="$TOOLCHAIN/bin/llvm-ranlib"
+          export STRIP="$TOOLCHAIN/bin/llvm-strip"
+          export CFLAGS='-O2 -fPIE'
+          export LDFLAGS='-pie'
+          cd dropbear-src
+          ./configure \
+            --host=aarch64-linux-android \
+            --disable-zlib \
+            --disable-syslog \
+            --disable-shadow \
+            --disable-pam \
+            --disable-loginfunc \
+            --disable-lastlog \
+            --disable-utmp \
+            --disable-utmpx \
+            --disable-wtmp \
+            --disable-wtmpx \
+            --disable-pututline \
+            --disable-pututxline
+          make -j2 PROGRAMS="dropbear dropbearkey"
+          "$STRIP" --strip-unneeded dropbear dropbearkey
+          file dropbear dropbearkey
+          "$TOOLCHAIN/bin/llvm-readelf" -h dropbear | grep -E 'Class:|Machine:'
+          "$TOOLCHAIN/bin/llvm-readelf" -l dropbear | grep -F '/system/bin/linker64'
+          install -m 0755 dropbear "$GITHUB_WORKSPACE/dist/dropbear"
+          install -m 0755 dropbearkey "$GITHUB_WORKSPACE/dist/dropbearkey"
+          if [ -f COPYING ]; then cp COPYING "$GITHUB_WORKSPACE/dist/DROPBEAR-LICENSE.txt"; fi
+
+      - name: Package Android service and Windows installer
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p dist
+          cat > dist/dropbear-service.sh <<'ANDROID_SCRIPT'
+          #!/system/bin/sh
+          # Dropbear 服务控制脚本：安装/启动/停止/状态/配置 Magisk 开机启动。
+          # 默认只允许 SSH 公钥认证；监听 TCP 2222；禁用 TCP 转发。
+          D=/data/ssh-dropbear
+          BIN="$D/dropbear"
+          KEYGEN="$D/dropbearkey"
+          HOSTKEY="$D/host_ed25519"
+          AUTHKEYS="$D/authorized_keys"
+          PIDFILE="$D/dropbear.pid"
+          LOGFILE="$D/dropbear.log"
+          PORT=2222
+
+          log() { echo "[dropbear-p230] $*"; }
+          is_our_pid() {
+              p="$1"
+              case "$p" in ''|*[!0-9]*) return 1 ;; esac
+              [ -r "/proc/$p/cmdline" ] || return 1
+              grep -aq "$BIN" "/proc/$p/cmdline" 2>/dev/null
+          }
+          start_service() {
+              if ! id | grep -q 'uid=0(root)'; then log '错误：必须以 root 运行。'; return 1; fi
+              [ -x "$BIN" ] || { log "找不到可执行文件：$BIN"; return 1; }
+              [ -x "$KEYGEN" ] || { log "找不到密钥工具：$KEYGEN"; return 1; }
+              [ -s "$AUTHKEYS" ] || { log "公钥文件不存在或为空：$AUTHKEYS"; return 1; }
+              if [ -f "$PIDFILE" ]; then
+                  oldpid="$(cat "$PIDFILE" 2>/dev/null)"
+                  if is_our_pid "$oldpid" && kill -0 "$oldpid" 2>/dev/null; then
+                      log "Dropbear 已运行，PID=$oldpid，端口=$PORT"; return 0
+                  fi
+                  rm -f "$PIDFILE"
+              fi
+              chmod 700 "$D"
+              chmod 755 "$BIN" "$KEYGEN"
+              chown 0:0 "$D" "$BIN" "$KEYGEN" "$AUTHKEYS" 2>/dev/null
+              chmod 600 "$AUTHKEYS"
+              if [ ! -s "$HOSTKEY" ]; then
+                  log '首次生成 ED25519 主机密钥……'
+                  "$KEYGEN" -t ed25519 -f "$HOSTKEY" >>"$LOGFILE" 2>&1 || {
+                      log '主机密钥生成失败，日志如下：'; cat "$LOGFILE" 2>/dev/null; return 1;
+                  }
+              fi
+              chown 0:0 "$HOSTKEY" 2>/dev/null
+              chmod 600 "$HOSTKEY"
+              : > "$LOGFILE"
+              if command -v nohup >/dev/null 2>&1; then
+                  nohup "$BIN" -F -p "$PORT" -r "$HOSTKEY" -D "$D" -P "$PIDFILE" -s -j -k </dev/null >>"$LOGFILE" 2>&1 &
+              else
+                  "$BIN" -F -p "$PORT" -r "$HOSTKEY" -D "$D" -P "$PIDFILE" -s -j -k </dev/null >>"$LOGFILE" 2>&1 &
+              fi
+              pid=$!
+              echo "$pid" > "$PIDFILE"
+              sleep 1
+              if kill -0 "$pid" 2>/dev/null; then
+                  log "Dropbear 已启动：PID=$pid，端口=$PORT，认证=仅 SSH 公钥。"
+                  log "日志文件：$LOGFILE"; return 0
+              fi
+              log 'Dropbear 启动失败，输出日志：'; cat "$LOGFILE" 2>/dev/null
+              rm -f "$PIDFILE"; return 1
+          }
+          stop_service() {
+              if [ ! -f "$PIDFILE" ]; then log '没有 PID 文件，服务可能未启动。'; return 0; fi
+              pid="$(cat "$PIDFILE" 2>/dev/null)"
+              if is_our_pid "$pid"; then
+                  kill "$pid" 2>/dev/null; sleep 1
+                  if kill -0 "$pid" 2>/dev/null; then kill -9 "$pid" 2>/dev/null; fi
+                  log "已停止 PID=$pid"
+              else
+                  log 'PID 文件不是当前 Dropbear 进程，避免误杀其他程序。'
+              fi
+              rm -f "$PIDFILE"
+          }
+          status_service() {
+              if [ -f "$PIDFILE" ]; then
+                  pid="$(cat "$PIDFILE" 2>/dev/null)"
+                  if is_our_pid "$pid" && kill -0 "$pid" 2>/dev/null; then
+                      log "运行中：PID=$pid，TCP 端口=$PORT"; return 0
+                  fi
+              fi
+              log '未运行。'; return 1
+          }
+          enable_boot() {
+              if [ -d /data/adb/modules ] || [ -d /data/adb/magisk ] || command -v magisk >/dev/null 2>&1; then
+                  mkdir -p /data/adb/service.d || { log '无法创建 /data/adb/service.d'; return 1; }
+                  cat > /data/adb/service.d/99-dropbear-p230.sh <<'BOOT'
+          #!/system/bin/sh
+          sleep 10
+          /data/ssh-dropbear/dropbear-service.sh start >/data/ssh-dropbear/boot.log 2>&1
+          BOOT
+                  chmod 755 /data/adb/service.d/99-dropbear-p230.sh
+                  log '已创建 Magisk service.d 开机启动脚本。'
+              else
+                  log '未检测到 Magisk；未修改系统启动配置。重启后可通过 ADB 手动启动：'
+                  log 'adb shell sh /data/ssh-dropbear/dropbear-service.sh start'
+              fi
+          }
+          case "${1:-start}" in
+              install) mkdir -p "$D" || exit 1; chmod 700 "$D"; start_service ;;
+              start) start_service ;;
+              stop) stop_service ;;
+              status) status_service ;;
+              enable-boot) enable_boot ;;
+              *) echo "用法：$0 {install|start|stop|status|enable-boot}"; exit 2 ;;
+          esac
+          ANDROID_SCRIPT
+
+          cat > dist/install-dropbear-p230.ps1 <<'POWERSHELL_SCRIPT'
+          #Requires -Version 5.1
+          <# P230 Android 7.1.2 / ARM64 Dropbear 安装器。需要 root ADB 与 Windows OpenSSH Client。 #>
+          [CmdletBinding()]
+          param([string]$Device = '192.168.0.194:5555', [string]$TargetIp = '192.168.0.194', [int]$SshPort = 2222)
+          $ErrorActionPreference = 'Stop'
+          function Stop-WithMessage([string]$Message) { Write-Host "错误：$Message" -ForegroundColor Red; exit 1 }
+          $script:AdbPath = Join-Path $PSScriptRoot 'adb.exe'
+          if (-not (Test-Path -LiteralPath $script:AdbPath)) {
+              $adbCommand = Get-Command adb.exe -ErrorAction SilentlyContinue
+              if ($adbCommand) { $script:AdbPath = $adbCommand.Source }
+              else { Stop-WithMessage '找不到 adb.exe。请把本脚本和 adb.exe 放在同一目录，或将 platform-tools 加入 PATH。' }
+          }
+          $dropbear = Join-Path $PSScriptRoot 'dropbear'
+          $dropbearkey = Join-Path $PSScriptRoot 'dropbearkey'
+          $serviceScript = Join-Path $PSScriptRoot 'dropbear-service.sh'
+          foreach ($f in @($dropbear, $dropbearkey, $serviceScript)) { if (-not (Test-Path -LiteralPath $f -PathType Leaf)) { Stop-WithMessage "缺少文件：$f。请使用完整 artifact。" } }
+          Write-Host "[1/7] ADB 连接：$Device" -ForegroundColor Cyan
+          & $script:AdbPath connect $Device
+          if ($LASTEXITCODE -ne 0) { Stop-WithMessage 'ADB connect 失败。' }
+          $deviceList = & $script:AdbPath devices
+          if (-not ($deviceList -match ([regex]::Escape($Device) + '\s+device\b'))) { Stop-WithMessage 'ADB 设备状态不是 device；若为 unauthorized，请在电视盒子确认授权。' }
+          Write-Host '[2/7] 检查 Root 权限' -ForegroundColor Cyan
+          $idOutput = & $script:AdbPath -s $Device shell id 2>&1
+          if ($LASTEXITCODE -ne 0 -or ($idOutput -join ' ') -notmatch 'uid=0\(root\)') { Stop-WithMessage "ADB shell 不是 root：$($idOutput -join ' ')" }
+          Write-Host ($idOutput -join ' ')
+          Write-Host '[3/7] 准备 Windows SSH 密钥；仅上传公钥' -ForegroundColor Cyan
+          $sshKeygen = Get-Command ssh-keygen.exe -ErrorAction SilentlyContinue
+          if (-not $sshKeygen) { Stop-WithMessage '找不到 ssh-keygen.exe，请在 Windows 可选功能中安装 OpenSSH Client。' }
+          $sshDir = Join-Path $env:USERPROFILE '.ssh'; New-Item -ItemType Directory -Force -Path $sshDir | Out-Null
+          $keyPath = Join-Path $sshDir 'p230_dropbear_ed25519'; $pubPath = "$keyPath.pub"
+          if (-not (Test-Path -LiteralPath $keyPath)) {
+              & $sshKeygen.Source -t ed25519 -a 64 -f $keyPath -C 'p230-dropbear'
+              if ($LASTEXITCODE -ne 0) { Stop-WithMessage '生成 SSH 密钥失败。' }
+          }
+          if (-not (Test-Path -LiteralPath $pubPath)) {
+              $pubText = & $sshKeygen.Source -y -f $keyPath
+              if ($LASTEXITCODE -ne 0 -or -not $pubText) { Stop-WithMessage '无法从现有私钥生成公钥。' }
+              [System.IO.File]::WriteAllText($pubPath, (($pubText -join "`n") + "`n"), [System.Text.Encoding]::ASCII)
+          }
+          Write-Host '[4/7] 复制二进制文件、服务脚本和公钥' -ForegroundColor Cyan
+          & $script:AdbPath -s $Device shell 'mkdir -p /data/ssh-dropbear'
+          if ($LASTEXITCODE -ne 0) { Stop-WithMessage '无法创建 /data/ssh-dropbear。' }
+          & $script:AdbPath -s $Device push $dropbear '/data/ssh-dropbear/dropbear'; if ($LASTEXITCODE -ne 0) { Stop-WithMessage '复制 dropbear 失败。' }
+          & $script:AdbPath -s $Device push $dropbearkey '/data/ssh-dropbear/dropbearkey'; if ($LASTEXITCODE -ne 0) { Stop-WithMessage '复制 dropbearkey 失败。' }
+          & $script:AdbPath -s $Device push $serviceScript '/data/ssh-dropbear/dropbear-service.sh'; if ($LASTEXITCODE -ne 0) { Stop-WithMessage '复制服务脚本失败。' }
+          & $script:AdbPath -s $Device push $pubPath '/data/ssh-dropbear/authorized_keys'; if ($LASTEXITCODE -ne 0) { Stop-WithMessage '复制 SSH 公钥失败。' }
+          Write-Host '[5/7] 安装并启动 SSH（编译时已关闭密码认证）' -ForegroundColor Cyan
+          & $script:AdbPath -s $Device shell sh /data/ssh-dropbear/dropbear-service.sh install
+          if ($LASTEXITCODE -ne 0) { & $script:AdbPath -s $Device shell cat /data/ssh-dropbear/dropbear.log; Stop-WithMessage 'Dropbear 启动失败，请把日志发回排查。' }
+          Write-Host '[6/7] 尝试配置 Magisk 开机启动' -ForegroundColor Cyan
+          & $script:AdbPath -s $Device shell sh /data/ssh-dropbear/dropbear-service.sh enable-boot
+          Write-Host '[7/7] 检查 SSH 端口' -ForegroundColor Cyan
+          Start-Sleep -Seconds 2; $tcpOk = $false
+          try { $tcpOk = Test-NetConnection -ComputerName $TargetIp -Port $SshPort -WarningAction SilentlyContinue -InformationLevel Quiet } catch { $tcpOk = $false }
+          if ($tcpOk) {
+              Write-Host 'SSH 端口已连通。运行以下命令登录：' -ForegroundColor Green
+              Write-Host "ssh -i `"$keyPath`" -o IdentitiesOnly=yes -p $SshPort root@$TargetIp" -ForegroundColor Green
+          } else {
+              Write-Host "暂未检测到 $TargetIp`:$SshPort 可连接，服务日志：" -ForegroundColor Yellow
+              & $script:AdbPath -s $Device shell cat /data/ssh-dropbear/dropbear.log
+          }
+          Write-Host '服务目录：/data/ssh-dropbear。不要将 SSH 2222 或 ADB 5555 映射到公网。'
+          POWERSHELL_SCRIPT
+          chmod 644 dist/dropbear-service.sh dist/install-dropbear-p230.ps1
+
+      - name: Write build metadata and checksums
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cat > dist/README-中文.txt <<'README'
+          斐讯 P230 / Android 7.1.2 / ARM64 的官方 Dropbear 云编译包
+
+          编译来源：官方 mkj/dropbear 仓库固定标签 DROPBEAR_2026.94。
+          不是电视盒子固件，不需要刷机。程序放在 /data/ssh-dropbear。
+          本构建已在编译选项中关闭 SSH 密码认证，只接受 authorized_keys 公钥认证。
+          authorized_keys 与它的专用目录由安装脚本设置为 root 所有，权限分别为 0600 和 0700。
+          默认 TCP 端口 2222，禁用本地/远程端口转发。
+
+          使用步骤：
+          1. 下载 GitHub Actions 的 artifact 并解压。
+          2. 将本目录内容放到 Windows platform-tools 目录（该目录应有 adb.exe），或确保 adb.exe 在 PATH 中。
+          3. 在 PowerShell 进入该目录并执行：
+             Set-ExecutionPolicy -Scope Process Bypass
+             .\install-dropbear-p230.ps1
+          4. 安装器会生成 Windows SSH 密钥；私钥留在电脑 %USERPROFILE%\.ssh\p230_dropbear_ed25519，只有 .pub 公钥会上传。
+          5. 登录命令由安装器打印。默认：ssh -i "$HOME\.ssh\p230_dropbear_ed25519" -p 2222 root@192.168.0.194
+
+          管理命令：
+          adb shell sh /data/ssh-dropbear/dropbear-service.sh status
+          adb shell sh /data/ssh-dropbear/dropbear-service.sh stop
+          adb shell sh /data/ssh-dropbear/dropbear-service.sh start
+
+          开机启动：只有检测到 Magisk 时才会安装 service.d 脚本；其他 Root 固件不会被擅自修改启动分区。
+          安全：切勿把 2222 或 ADB 5555 暴露到公网。建议确认 SSH 可用后，关闭不需要的网络 ADB。
+
+          来源与差异：SOURCE_INFO.txt、UPSTREAM_COMMIT.txt、android-local-patches.diff。
+          SHA256SUMS 用于校验本目录主要文件。请自行检查源码差异后使用。
+          README
+          {
+            printf '%s\n' dropbear dropbearkey dropbear-service.sh install-dropbear-p230.ps1 android-local-patches.diff SOURCE_INFO.txt UPSTREAM_COMMIT.txt DROPBEAR-LICENSE.txt README-中文.txt
+          } | while read -r f; do
+            if [ -f "dist/$f" ]; then sha256sum "dist/$f"; fi
+          done > dist/SHA256SUMS
+          cat dist/SOURCE_INFO.txt
+          cat dist/SHA256SUMS
+
+      - name: Upload downloadable ARM64 build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Dropbear-P230-Android-ARM64
+          path: dist/
+          if-no-files-found: error
+          retention-days: 90
