@@ -100,7 +100,7 @@ jobs:
           auth = root / 'src/svr-authpubkey.c'
           s = auth.read_text()
           start = s.index('static int checkpubkeyperms() {')
-          end = s.index('/* Checks whether a file is owned by the user or root', start)
+          end = s.index('/* Checks that a file is owned by the user or root', start)
           replacement = r'''static int checkpubkeyperms() {
               char *path = authorized_keys_filepath(), *sep = NULL;
               int ret = DROPBEAR_SUCCESS;
